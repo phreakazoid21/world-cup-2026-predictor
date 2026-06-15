@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import math
+import re
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -51,6 +52,40 @@ for d in [DATA_DIR, MODEL_DIR, VIS_DIR]:
 RESULTS_URL = (
     "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 )
+
+# Live FIFA World Cup 2026 results + schedule (openfootball, public domain, no key)
+WC2026_JSON_URL = (
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
+)
+
+# Co-hosts of WC2026 — given home advantage when listed as the home side
+HOST_NATIONS = {"USA", "Canada", "Mexico"}
+
+# Canonical team names: the same nation is spelled differently across the
+# historical dataset (martj42), the openfootball feed, and our schedule below.
+# Everything is mapped to ONE spelling so Elo ratings line up end-to-end.
+TEAM_NAME_MAP = {
+    "Czech Republic":         "Czechia",
+    "Korea Republic":         "South Korea",
+    "Korea DPR":              "North Korea",
+    "United States":          "USA",
+    "Bosnia & Herzegovina":   "Bosnia and Herzegovina",
+    "Bosnia-Herzegovina":     "Bosnia and Herzegovina",
+    "Curaçao":                "Curacao",
+    "Côte d'Ivoire":          "Ivory Coast",
+    "Cote d'Ivoire":          "Ivory Coast",
+    "IR Iran":                "Iran",
+    "Türkiye":                "Turkey",
+    "Turkiye":                "Turkey",
+    "Cabo Verde":             "Cape Verde",
+    "China PR":               "China",
+}
+
+
+def normalize_team(name: str) -> str:
+    """Map differing data-source spellings of a nation to one canonical name."""
+    n = str(name).strip()
+    return TEAM_NAME_MAP.get(n, n)
 
 # FIFA World Cup 2026 group stage schedule (openfootball public domain data)
 WC2026_MATCHES = [
@@ -151,14 +186,21 @@ WC2026_MATCHES = [
     ("Croatia",       "Ghana",                 "2026-06-27"),
 ]
 
+# The 48 nations actually at WC2026 (used to filter out knockout placeholders
+# like "1A" / "W73" that openfootball uses before the bracket is decided).
+WC2026_TEAMS = {normalize_team(t) for m in WC2026_MATCHES for t in (m[0], m[1])}
+
 
 # ──────────────────────────────────────────────
 # STEP 1 – DATA LOADING
 # ──────────────────────────────────────────────
 
-def load_results(max_rows: int = 50_000) -> pd.DataFrame:
+def load_results(max_rows: int = 50_000, include_wc2026: bool = True) -> pd.DataFrame:
     """
-    Load historical international match results.
+    Load historical international match results (martj42 dataset), then merge in
+    the latest *played* World Cup 2026 matches from the openfootball feed so the
+    Elo ratings and model reflect games that have already happened.
+
     Falls back to synthetic data if the network is unavailable
     (useful for offline testing / sandboxed environments).
     """
@@ -188,7 +230,23 @@ def load_results(max_rows: int = 50_000) -> pd.DataFrame:
     dropped = before - len(df)
     if dropped > 0:
         print(f"    Dropped {dropped} rows with missing scores.")
-    print(f"    {len(df):,} matches loaded (1990–present).")
+
+    # Unify team-name spellings so they match the schedule + openfootball feed
+    df["home_team"] = df["home_team"].map(normalize_team)
+    df["away_team"] = df["away_team"].map(normalize_team)
+    print(f"    {len(df):,} historical matches loaded (1990–present).")
+
+    # Merge in the latest played WC2026 results from openfootball
+    if include_wc2026:
+        wc = load_wc2026_results()
+        if not wc.empty:
+            df = pd.concat([df, wc], ignore_index=True)
+            # openfootball is authoritative for WC2026 → drop any stale duplicate
+            df = df.drop_duplicates(
+                subset=["date", "home_team", "away_team"], keep="last"
+            )
+
+    df = df.sort_values("date").reset_index(drop=True)
     return df
 
 
@@ -230,6 +288,98 @@ def _synthetic_results(n: int = 50_000) -> pd.DataFrame:
             "neutral":    rng.random() > 0.6,
         })
     return pd.DataFrame(rows)
+
+
+# ──────────────────────────────────────────────
+# STEP 1b – LIVE WORLD CUP 2026 DATA (openfootball)
+# ──────────────────────────────────────────────
+
+def _fetch_wc2026() -> dict:
+    """
+    Fetch the latest openfootball WC2026 feed (104 matches, ~100 KB).
+    Always tries the network first so results stay current, falling back to a
+    local cache when offline.
+    """
+    cache = DATA_DIR / "worldcup2026.json"
+    try:
+        resp = requests.get(WC2026_JSON_URL, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        cache.write_text(json.dumps(data))
+        return data
+    except Exception as e:
+        if cache.exists():
+            print(f"    ⚠️  Network unavailable ({e}); using cached WC2026 feed.")
+            return json.loads(cache.read_text())
+        print(f"    ⚠️  Could not fetch WC2026 feed ({e}).")
+        return {"matches": []}
+
+
+def _is_real_team(name: str) -> bool:
+    """False for bracket placeholders like '1A', '2B', '3A/B/C/D/F', 'W73', 'L101'."""
+    n = str(name).strip()
+    return bool(n) and not re.match(r"^(\d|[WL]\d|.+/)", n)
+
+
+def load_wc2026_results() -> pd.DataFrame:
+    """
+    Latest *played* WC2026 matches, reshaped to the historical training schema:
+    date / home_team / away_team / home_score / away_score / tournament / neutral.
+    """
+    rows = []
+    for m in _fetch_wc2026().get("matches", []):
+        ft = (m.get("score") or {}).get("ft")
+        if not ft or len(ft) != 2:
+            continue  # not played yet
+        home = normalize_team(m.get("team1", ""))
+        away = normalize_team(m.get("team2", ""))
+        if not (_is_real_team(home) and _is_real_team(away)):
+            continue
+        rows.append({
+            "date":       m.get("date"),
+            "home_team":  home,
+            "away_team":  away,
+            "home_score": int(ft[0]),
+            "away_score": int(ft[1]),
+            "tournament": "FIFA World Cup",
+            # WC matches are at neutral venues except when a co-host plays at home
+            "neutral":    home not in HOST_NATIONS,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        print(f"    🏟️  Merged {len(df)} played WC2026 matches from openfootball.")
+    return df
+
+
+def upcoming_fixtures() -> pd.DataFrame:
+    """
+    Scheduled WC2026 matches that have NOT been played yet and whose teams are
+    already confirmed (knockout slots with placeholder teams are skipped).
+    Returns date / home_team / away_team / round / group / ground / neutral.
+    """
+    rows = []
+    for m in _fetch_wc2026().get("matches", []):
+        if (m.get("score") or {}).get("ft"):
+            continue  # already played
+        home = normalize_team(m.get("team1", ""))
+        away = normalize_team(m.get("team2", ""))
+        if home not in WC2026_TEAMS or away not in WC2026_TEAMS:
+            continue  # knockout matchup not decided yet
+        rows.append({
+            "date":      m.get("date"),
+            "home_team": home,
+            "away_team": away,
+            "round":     m.get("round"),
+            "group":     m.get("group"),
+            "ground":    m.get("ground"),
+            "neutral":   home not in HOST_NATIONS,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+    return df
 
 
 # ──────────────────────────────────────────────
@@ -562,6 +712,7 @@ def predict_match(
     }])
 
     probs = model.predict_proba(X)[0]  # [away, draw, home]
+    p_away, p_draw, p_home = float(probs[0]), float(probs[1]), float(probs[2])
 
     # Expected goals via Dixon-Coles-style attack/defence balance
     # Using form-based lambda with Elo adjustment
@@ -569,17 +720,26 @@ def predict_match(
     xg_home = max(0.3, h_sc * elo_factor * 0.7 + (1 - a_cc / 2) * 0.3)
     xg_away = max(0.3, a_sc / elo_factor * 0.7 + (1 - h_cc / 2) * 0.3)
 
+    # Most likely outcome → predicted winner + confidence (its probability)
+    outcomes = {"home": p_home, "draw": p_draw, "away": p_away}
+    best = max(outcomes, key=lambda k: outcomes[k])
+    winner = {"home": home, "away": away, "draw": "Draw"}[best]
+
     return {
-        "home":      home,
-        "away":      away,
-        "elo_home":  round(elo_h, 0),
-        "elo_away":  round(elo_a, 0),
-        "p_home":    round(float(probs[2]), 3),
-        "p_draw":    round(float(probs[1]), 3),
-        "p_away":    round(float(probs[0]), 3),
-        "xg_home":   round(float(xg_home), 2),
-        "xg_away":   round(float(xg_away), 2),
-        "favorite":  home if probs[2] > probs[0] else away,
+        "home":       home,
+        "away":       away,
+        "elo_home":   round(elo_h, 0),
+        "elo_away":   round(elo_a, 0),
+        "p_home":     round(p_home, 3),
+        "p_draw":     round(p_draw, 3),
+        "p_away":     round(p_away, 3),
+        "xg_home":    round(float(xg_home), 2),
+        "xg_away":    round(float(xg_away), 2),
+        "score_home": int(round(xg_home)),
+        "score_away": int(round(xg_away)),
+        "winner":     winner,
+        "confidence": round(outcomes[best], 3),
+        "favorite":   home if p_home > p_away else away,
     }
 
 
@@ -831,13 +991,38 @@ def print_prediction(pred: dict):
     print(f"  {'Away win':<12} {a_bar:<40} {pred['p_away']*100:5.1f}%  (Elo {pred['elo_away']:.0f})")
     print(f"  {'─'*52}")
     print(f"  xG: {pred['home']} {pred['xg_home']:.2f} – {pred['xg_away']:.2f} {pred['away']}")
-    print(f"  🏅  Favorite: {pred['favorite']}")
+    print(f"  🔢  Predicted score: {pred['home']} {pred['score_home']}–{pred['score_away']} {pred['away']}")
+    if pred["winner"] == "Draw":
+        print(f"  🏅  Prediction: Draw  ({pred['confidence']*100:.1f}% confidence)")
+    else:
+        print(f"  🏅  Predicted winner: {pred['winner']}  ({pred['confidence']*100:.1f}% confidence)")
+
+
+def _slug(team: str) -> str:
+    """Filesystem-safe slug for chart filenames (e.g. 'Saudi Arabia' → 'saudi_arabia')."""
+    return re.sub(r"[^a-z0-9]+", "_", team.lower()).strip("_")
+
+
+def print_fixtures(fixtures: pd.DataFrame):
+    """List upcoming WC2026 fixtures with index numbers for --game selection."""
+    if fixtures.empty:
+        print("\n📅  No upcoming fixtures with confirmed teams were found.")
+        return
+    print("\n📅  Upcoming WC2026 fixtures (use --game N to predict one):")
+    for i, r in fixtures.iterrows():
+        stage = r.get("group") or r.get("round") or ""
+        print(f"  [{i:>2}]  {r['date'].date()}  "
+              f"{r['home_team']:>22} vs {r['away_team']:<22}  {stage}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="FIFA 2026 Match Predictor")
     parser.add_argument("--match", nargs=2, metavar=("HOME", "AWAY"),
                         help="Predict a specific match")
+    parser.add_argument("--upcoming", action="store_true",
+                        help="List upcoming WC2026 fixtures (with index numbers)")
+    parser.add_argument("--game", type=int, metavar="N",
+                        help="Predict upcoming fixture number N (see --upcoming)")
     parser.add_argument("--simulate", action="store_true",
                         help="Run full tournament simulation")
     parser.add_argument("--rankings", action="store_true",
@@ -855,13 +1040,34 @@ def main():
     print(elo.top_n(15).to_string(index=False))
     plot_elo_rankings(elo, save_path=VIS_DIR / "elo_rankings.png")
 
+    # ── Upcoming fixtures (live from openfootball) ───────────
+    fixtures = upcoming_fixtures()
+    if args.upcoming:
+        print_fixtures(fixtures)
+
     # ── Match predictions ─────────────────────
-    if args.match:
-        home, away = args.match
+    if args.game is not None:
+        if fixtures.empty or not (0 <= args.game < len(fixtures)):
+            print_fixtures(fixtures)
+            print(f"\n❌  No upcoming fixture #{args.game}. Pick an index above.")
+            return
+        row = fixtures.iloc[args.game]
+        home, away = row["home_team"], row["away_team"]
+        print(f"\n🔮  Predicting upcoming fixture #{args.game}: "
+              f"{home} vs {away} on {row['date'].date()}")
+        pred = predict_match(home, away, elo, model, feat_df,
+                             neutral=bool(row["neutral"]), is_wc=True)
+        print_prediction(pred)
+        plot_match_prediction(pred,
+            save_path=VIS_DIR / f"pred_{_slug(home)}_{_slug(away)}.png")
+    elif args.match:
+        home, away = normalize_team(args.match[0]), normalize_team(args.match[1])
         pred = predict_match(home, away, elo, model, feat_df)
         print_prediction(pred)
         plot_match_prediction(pred,
-            save_path=VIS_DIR / f"pred_{home.lower()}_{away.lower()}.png")
+            save_path=VIS_DIR / f"pred_{_slug(home)}_{_slug(away)}.png")
+    elif args.upcoming:
+        pass  # already listed fixtures above; nothing more to predict
     else:
         # Demo: predict a selection of high-interest WC26 group matches
         demo_matches = [
@@ -876,7 +1082,7 @@ def main():
             print_prediction(pred)
             plot_match_prediction(
                 pred,
-                save_path=VIS_DIR / f"pred_{home.lower()}_{away.lower()}.png",
+                save_path=VIS_DIR / f"pred_{_slug(home)}_{_slug(away)}.png",
             )
 
     # ── Tournament simulation ──────────────────
