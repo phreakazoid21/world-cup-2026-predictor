@@ -21,9 +21,19 @@ python predictor.py
 # 4. Predict a specific match
 python predictor.py --match "Brazil" "France"
 
-# 5. Full tournament simulation (10,000 runs)
+# 5. List upcoming WC2026 fixtures (live, from openfootball)
+python predictor.py --upcoming
+
+# 6. Predict an upcoming fixture by its index number
+python predictor.py --game 0
+
+# 7. Full tournament simulation (10,000 runs)
 python predictor.py --simulate
 ```
+
+Each prediction reports the **predicted winner + win probability**, a
+**predicted scoreline**, and a **confidence** number (the probability of the
+most likely outcome).
 
 Charts are saved to the `visuals/` folder — ready to use in videos.
 
@@ -53,7 +63,12 @@ fifa_predictor/
 ### 1. Data
 - **Historical matches:** 50,000+ international results from 1990–2026
   - Source: [martj42/international_results](https://github.com/martj42/international_results) (free, no key)
-- **Live WC26 schedule:** hardcoded from [openfootball/worldcup.json](https://github.com/openfootball/worldcup.json)
+- **Live WC26 results + schedule:** pulled at runtime from
+  [openfootball/worldcup.json](https://github.com/openfootball/worldcup.json)
+  (public domain, no key). `load_results()` reshapes the feed to the historical
+  schema and merges already-played WC2026 matches into the training set, so Elo
+  ratings update as the tournament progresses. `upcoming_fixtures()` exposes the
+  not-yet-played games you can predict with `--upcoming` / `--game`.
 - **During tournament:** plug in [BALLDONTLIE FIFA API](https://fifa.balldontlie.io/) (free tier)
 
 ### 2. Elo Rating System
